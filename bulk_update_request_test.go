@@ -75,3 +75,19 @@ func TestBulkUpdateRequestSerialization(t *testing.T) {
 		}
 	}
 }
+
+var bulkUpdateRequestSerializationResult string
+
+func BenchmarkBulkUpdateRequestSerialization(b *testing.B) {
+	r := NewBulkUpdateRequest().Index("index1").Type("tweet").Id("1").Doc(struct {
+		Counter int64 `json:"counter"`
+	}{
+		Counter: 42,
+	})
+	var s string
+	for n := 0; n < b.N; n++ {
+		s = r.String()
+		r.source = nil // Don't let caching spoil the benchmark
+	}
+	bulkUpdateRequestSerializationResult = s // ensure the compiler doesn't optimize
+}

@@ -61,11 +61,8 @@ func BenchmarkSearchMatchAll(b *testing.B) {
 		if searchResult.Hits == nil {
 			b.Errorf("expected SearchResult.Hits != nil; got nil")
 		}
-		if searchResult.Hits.TotalHits != 4 {
-			b.Errorf("expected SearchResult.Hits.TotalHits = %d; got %d", 4, searchResult.Hits.TotalHits)
-		}
-		if len(searchResult.Hits.Hits) != 4 {
-			b.Errorf("expected len(SearchResult.Hits.Hits) = %d; got %d", 4, len(searchResult.Hits.Hits))
+		if searchResult.Hits.TotalHits == 0 {
+			b.Errorf("expected SearchResult.Hits.TotalHits > %d; got %d", 0, searchResult.Hits.TotalHits)
 		}
 	}
 }
@@ -881,5 +878,62 @@ func TestSearchInnerHitsOnHasParent(t *testing.T) {
 	}
 	if innerHits.Hits.Hits[0].Id != "t3" {
 		t.Fatalf("expected inner hit with id %q; got: %q", "t3", innerHits.Hits.Hits[0].Id)
+	}
+}
+
+func TestSearchBuildURL(t *testing.T) {
+	client := setupTestClient(t)
+
+	tests := []struct {
+		Indices  []string
+		Types    []string
+		Expected string
+	}{
+		{
+			[]string{},
+			[]string{},
+			"/_search",
+		},
+		{
+			[]string{"index1"},
+			[]string{},
+			"/index1/_search",
+		},
+		{
+			[]string{"index1", "index2"},
+			[]string{},
+			"/index1%2Cindex2/_search",
+		},
+		{
+			[]string{},
+			[]string{"type1"},
+			"/_all/type1/_search",
+		},
+		{
+			[]string{"index1"},
+			[]string{"type1"},
+			"/index1/type1/_search",
+		},
+		{
+			[]string{"index1", "index2"},
+			[]string{"type1", "type2"},
+			"/index1%2Cindex2/type1%2Ctype2/_search",
+		},
+		{
+			[]string{},
+			[]string{"type1", "type2"},
+			"/_all/type1%2Ctype2/_search",
+		},
+	}
+
+	for i, test := range tests {
+		path, _, err := client.Search().Index(test.Indices...).Type(test.Types...).buildURL()
+		if err != nil {
+			t.Errorf("case #%d: %v", i+1, err)
+			continue
+		}
+		if path != test.Expected {
+			t.Errorf("case #%d: expected %q; got: %q", i+1, test.Expected, path)
+		}
 	}
 }

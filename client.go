@@ -1,4 +1,4 @@
-// Copyright 2012-2015 Oliver Eilhard. All rights reserved.
+// Copyright 2012-present Oliver Eilhard. All rights reserved.
 // Use of this source code is governed by a MIT-license.
 // See http://olivere.mit-license.org/license.txt for details.
 
@@ -21,7 +21,7 @@ import (
 
 const (
 	// Version is the current version of Elastic.
-	Version = "3.0.24"
+	Version = "3.0.38"
 
 	// DefaultUrl is the default endpoint of Elasticsearch on the local machine.
 	// It is used e.g. when initializing a new Client without a specific URL.
@@ -679,18 +679,20 @@ func (c *Client) dumpResponse(resp *http.Response) {
 
 // sniffer periodically runs sniff.
 func (c *Client) sniffer() {
-	for {
-		c.mu.RLock()
-		timeout := c.snifferTimeout
-		ticker := time.After(c.snifferInterval)
-		c.mu.RUnlock()
+	c.mu.RLock()
+	timeout := c.snifferTimeout
+	c.mu.RUnlock()
 
+	ticker := time.NewTicker(timeout)
+	defer ticker.Stop()
+
+	for {
 		select {
 		case <-c.snifferStop:
 			// we are asked to stop, so we signal back that we're stopping now
 			c.snifferStop <- true
 			return
-		case <-ticker:
+		case <-ticker.C:
 			c.sniff(timeout)
 		}
 	}
@@ -756,10 +758,6 @@ func (c *Client) sniff(timeout time.Duration) error {
 	}
 }
 
-// reSniffHostAndPort is used to extract hostname and port from a result
-// from a Nodes Info API (example: "inet[/127.0.0.1:9200]").
-var reSniffHostAndPort = regexp.MustCompile(`\/([^:]*):([0-9]+)\]`)
-
 // sniffNode sniffs a single node. This method is run as a goroutine
 // in sniff. If successful, it returns the list of node URLs extracted
 // from the result of calling Nodes Info API. Otherwise, an empty array
@@ -797,27 +795,15 @@ func (c *Client) sniffNode(url string) []*conn {
 			switch c.scheme {
 			case "https":
 				for nodeID, node := range info.Nodes {
-					if strings.HasPrefix(node.HTTPSAddress, "inet") {
-						m := reSniffHostAndPort.FindStringSubmatch(node.HTTPSAddress)
-						if len(m) == 3 {
-							url := fmt.Sprintf("https://%s:%s", m[1], m[2])
-							nodes = append(nodes, newConn(nodeID, url))
-						}
-					} else {
-						url := fmt.Sprintf("https://%s", node.HTTPSAddress)
+					url := c.extractHostname("https", node.HTTPSAddress)
+					if url != "" {
 						nodes = append(nodes, newConn(nodeID, url))
 					}
 				}
 			default:
 				for nodeID, node := range info.Nodes {
-					if strings.HasPrefix(node.HTTPAddress, "inet") {
-						m := reSniffHostAndPort.FindStringSubmatch(node.HTTPAddress)
-						if len(m) == 3 {
-							url := fmt.Sprintf("http://%s:%s", m[1], m[2])
-							nodes = append(nodes, newConn(nodeID, url))
-						}
-					} else {
-						url := fmt.Sprintf("http://%s", node.HTTPAddress)
+					url := c.extractHostname("http", node.HTTPAddress)
+					if url != "" {
 						nodes = append(nodes, newConn(nodeID, url))
 					}
 				}
@@ -825,6 +811,27 @@ func (c *Client) sniffNode(url string) []*conn {
 		}
 	}
 	return nodes
+}
+
+// reSniffHostAndPort is used to extract hostname and port from a result
+// from a Nodes Info API (example: "inet[/127.0.0.1:9200]").
+var reSniffHostAndPort = regexp.MustCompile(`\/([^:]*):([0-9]+)\]`)
+
+func (c *Client) extractHostname(scheme, address string) string {
+	if strings.HasPrefix(address, "inet") {
+		m := reSniffHostAndPort.FindStringSubmatch(address)
+		if len(m) == 3 {
+			return fmt.Sprintf("%s://%s:%s", scheme, m[1], m[2])
+		}
+	}
+	s := address
+	if idx := strings.Index(s, "/"); idx >= 0 {
+		s = s[idx+1:]
+	}
+	if strings.Index(s, ":") < 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s://%s", scheme, s)
 }
 
 // updateConns updates the clients' connections with new information
@@ -861,18 +868,20 @@ func (c *Client) updateConns(conns []*conn) {
 
 // healthchecker periodically runs healthcheck.
 func (c *Client) healthchecker() {
-	for {
-		c.mu.RLock()
-		timeout := c.healthcheckTimeout
-		ticker := time.After(c.healthcheckInterval)
-		c.mu.RUnlock()
+	c.mu.RLock()
+	timeout := c.healthcheckTimeout
+	c.mu.RUnlock()
 
+	ticker := time.NewTicker(timeout)
+	defer ticker.Stop()
+
+	for {
 		select {
 		case <-c.healthcheckStop:
 			// we are asked to stop, so we signal back that we're stopping now
 			c.healthcheckStop <- true
 			return
-		case <-ticker:
+		case <-ticker.C:
 			c.healthcheck(timeout, false)
 		}
 	}
@@ -1189,6 +1198,11 @@ func (c *Client) Update() *UpdateService {
 	return NewUpdateService(c)
 }
 
+// UpdateByQuery performs an update on a set of documents.
+func (c *Client) UpdateByQuery(indices ...string) *UpdateByQueryService {
+	return NewUpdateByQueryService(c).Index(indices...)
+}
+
 // Bulk is the entry point to mass insert/update/delete documents.
 func (c *Client) Bulk() *BulkService {
 	return NewBulkService(c)
@@ -1197,6 +1211,31 @@ func (c *Client) Bulk() *BulkService {
 // BulkProcessor allows setting up a concurrent processor of bulk requests.
 func (c *Client) BulkProcessor() *BulkProcessorService {
 	return NewBulkProcessorService(c)
+}
+
+// Reindex returns a service that will reindex documents from a source
+// index into a target index.
+//
+// Notice that this Reindexer is an Elastic-specific solution that pre-dated
+// the Reindex API introduced in Elasticsearch 2.3.0 (see ReindexTask).
+//
+// See http://www.elastic.co/guide/en/elasticsearch/guide/current/reindex.html
+// for more information about reindexing.
+func (c *Client) Reindex(sourceIndex, targetIndex string) *Reindexer {
+	return NewReindexer(c, sourceIndex, CopyToTargetIndex(targetIndex))
+}
+
+// ReindexTask copies data from a source index into a destination index.
+//
+// The Reindex API has been introduced in Elasticsearch 2.3.0. Notice that
+// there is a Elastic-specific Reindexer that pre-dates the Reindex API from
+// Elasticsearch. If you rely on that, use the ReindexerService via
+// Client.Reindex.
+//
+// See https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-reindex.html
+// for details on the Reindex API.
+func (c *Client) ReindexTask() *ReindexService {
+	return NewReindexService(c)
 }
 
 // TODO Term Vectors
@@ -1457,6 +1496,16 @@ func (c *Client) NodesInfo() *NodesInfoService {
 	return NewNodesInfoService(c)
 }
 
+// TasksCancel cancels tasks running on the specified nodes.
+func (c *Client) TasksCancel() *TasksCancelService {
+	return NewTasksCancelService(c)
+}
+
+// TasksList retrieves the list of tasks running on the specified nodes.
+func (c *Client) TasksList() *TasksListService {
+	return NewTasksListService(c)
+}
+
 // TODO Pending cluster tasks
 // TODO Cluster Reroute
 // TODO Cluster Update Settings
@@ -1507,14 +1556,6 @@ func (c *Client) IndexNames() ([]string, error) {
 // Notice that you need to specify a URL here explicitly.
 func (c *Client) Ping(url string) *PingService {
 	return NewPingService(c).URL(url)
-}
-
-// Reindex returns a service that will reindex documents from a source
-// index into a target index. See
-// http://www.elastic.co/guide/en/elasticsearch/guide/current/reindex.html
-// for more information about reindexing.
-func (c *Client) Reindex(sourceIndex, targetIndex string) *Reindexer {
-	return NewReindexer(c, sourceIndex, CopyToTargetIndex(targetIndex))
 }
 
 // WaitForStatus waits for the cluster to have the given status.
